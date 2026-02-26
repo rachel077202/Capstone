@@ -1,7 +1,7 @@
 ### Installation
-Follow the linked instructions to install and build the PX4 simulator: [PX4 Installation] (https://docs.px4.io/main/en/dev_setup/building_px4)
+Follow the linked instructions to install and build the PX4 simulator: [PX4 Installation](https://docs.px4.io/main/en/dev_setup/building_px4)
 
-Follow the instructions to download QGroundControl: [QGroundControl Installation] (https://docs.qgroundcontrol.com/master/en/qgc-user-guide/getting_started/download_and_install.html)
+Follow the instructions to download QGroundControl: [QGroundControl Installation](https://docs.qgroundcontrol.com/master/en/qgc-user-guide/getting_started/download_and_install.html)
 
 ### Set Up
 * Download drone_control.py
