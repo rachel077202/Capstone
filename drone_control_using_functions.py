@@ -68,6 +68,7 @@ async def run():
                     elif event.key == pygame.K_l and offboard_active:
                         await land(drone)
                         offboard_active = False
+                        running = False
                     elif event.key == pygame.K_SPACE and offboard_active:
                         await hover(drone)
                     elif event.key == pygame.K_s:
@@ -106,7 +107,7 @@ async def run():
             f"  Up/Down      : R   [{abs(up_speed):.1f} m/s]",
             f"  Yaw          : E   [{abs(yaw_speed):.1f} deg/s]",
             "",
-            "  T=Takeoff  L=Land  SPACE=Hover  ESC=Stop",
+            "  L=Land  SPACE=Hover  ESC=Stop",
         ]
         for i, line in enumerate(lines):
             color = (0, 255, 120) if i == 0 else (180, 180, 50) if i == 1 else (200, 200, 200)

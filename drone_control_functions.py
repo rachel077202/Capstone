@@ -1,6 +1,7 @@
 import asyncio
 from mavsdk import System
 from mavsdk.offboard import OffboardError, VelocityBodyYawspeed
+from mavsdk.telemetry import LandedState
 
 async def wait_for_disarm(drone, timeout=15):
     """Wait until drone reports it is no longer armed, up to `timeout` seconds.
@@ -69,16 +70,17 @@ async def land(drone):
         await drone.offboard.stop()
     except Exception as e:
         print(f"Offboard stop error: {e}")
-        await asyncio.sleep(0.5)
-        await drone.action.land()
-        print("Waiting for drone to land and auto-disarm...")
-        # PX4 will auto-disarm after landing — just wait for it
-        await wait_for_disarm(drone, timeout=30)
-        print("Disarmed.")
-        print("Arming...")
-                    
-        await drone.action.arm()
-        print("Armed. Press T to take off.")
+
+    await asyncio.sleep(0.5)
+    await drone.action.land()
+    print("Waiting for drone to land and auto-disarm...")
+    async for state in drone.telemetry.landed_state():
+        if state == LandedState.ON_GROUND:
+            break
+
+    # PX4 will auto-disarm after landing — just wait for it
+    await wait_for_disarm(drone, timeout=30)
+    print("Disarmed.")
 
 async def hover(drone):
     """Tells the drone to hover in place.
