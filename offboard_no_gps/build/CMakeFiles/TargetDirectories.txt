@@ -1,0 +1,3 @@
+/home/nick/MAVSDK/cpp/examples/offboard_no_gps/build/CMakeFiles/offboard_no_gps.dir
+/home/nick/MAVSDK/cpp/examples/offboard_no_gps/build/CMakeFiles/edit_cache.dir
+/home/nick/MAVSDK/cpp/examples/offboard_no_gps/build/CMakeFiles/rebuild_cache.dir
