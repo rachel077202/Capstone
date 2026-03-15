@@ -44,6 +44,12 @@ bool test_attitude_control(mavsdk::Offboard& offboard)
 
     // Start offboard mode
     std::cout << "Starting offboard mode...\n";
+    // ADD: Send the setpoint multiple times before starting (bypassing wifi timeout issue)
+    for (int i = 0; i < 10; i++) {
+        offboard.set_attitude(hover);
+        sleep_for(milliseconds(100));
+    }
+    // Same as before
     Offboard::Result offboard_result = offboard.start();
     if (offboard_result != Offboard::Result::Success) {
         std::cerr << "Offboard start failed: " << offboard_result << '\n';
