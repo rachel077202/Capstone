@@ -25,7 +25,7 @@ async def run():
     offboard_active = True
     clock = pygame.time.Clock()
     running = True
-    foward_speed=right_speed=up_speed=yaw_speed=0.0
+    forward_speed=right_speed=up_speed=yaw_speed=0.0
     speed_pct = 0.5          # default 50%
     input_text = ""          # what the user is typing
     input_active = False     # is the input box focused?
@@ -78,32 +78,19 @@ async def run():
         # --- Movement (only when not typing) ---
         if offboard_active and not input_active:
             if keys[pygame.K_w]:
-                forward_speed = speed_pct
+                forward_speed = await forward_backward(drone, speed_pct)
                 right_speed=up_speed=yaw_speed=0.0
-            elif keys[pygame.K_d]:
-                right_speed = speed_pct
-                forward_speed=up_speed=yaw_speed=0.0
             elif keys[pygame.K_e]:
-                yaw_speed = speed_pct
+                yaw_speed = await yaw(drone, speed_pct)
                 forward_speed=right_speed=up_speed=0.0
             elif keys[pygame.K_r]:
-                up_speed = speed_pct
+                up_speed = await up_down(drone, speed_pct)
                 forward_speed=right_speed=yaw_speed=0.0
+            elif keys[pygame.K_d]:
+                right_speed = await right_left(drone, speed_pct)
+                forward_speed=up_speed=yaw_speed=0.0
             else:
                 forward_speed=right_speed=up_speed=yaw_speed=0.0
-
-            # Always send a setpoint every loop tick
-            max_speed = 2.0
-            max_yaw = 30.0
-            max_vert = 1.5
-            await drone.offboard.set_velocity_body(
-                VelocityBodyYawspeed(
-                    max_speed * forward_speed,
-                    max_speed * right_speed,
-                    -1 * max_vert * up_speed,
-                    max_yaw * yaw_speed
-                )
-            )
 
         # --- HUD ---
         screen.fill((20, 20, 20))
@@ -113,7 +100,7 @@ async def run():
             f"  Status       : {status}",
             f"  Speed %      : {speed_pct:+.2f}  (S to change)",
             "",
-            f"  Forward/Back : W   [{abs(foward_speed):.1f} m/s]",
+            f"  Forward/Back : W   [{abs(forward_speed):.1f} m/s]",
             f"  Left/Right   : D   [{abs(right_speed):.1f} m/s]",
             f"  Up/Down      : R   [{abs(up_speed):.1f} m/s]",
             f"  Yaw          : E   [{abs(yaw_speed):.1f} deg/s]",
