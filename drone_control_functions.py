@@ -36,10 +36,10 @@ async def arm_takeoff(connection_url):
             break
 
     print("Waiting for drone to be ready...")
-    async for health in drone.telemetry.health():
-        if health.is_global_position_ok and health.is_home_position_ok:
-            print("Drone is ready to arm!")
-            break
+    # async for health in drone.telemetry.health():
+    #     if health.is_global_position_ok and health.is_home_position_ok:
+    #         print("Drone is ready to arm!")
+    #         break
 
     print("Arming...")
     await drone.action.arm()
@@ -105,8 +105,11 @@ async def forward_backward(drone, speed_percentage):
         speed (float): The speed that the drone is moving at
     """
     max_speed = 2.0 # m/s
-    
-    await drone.offboard.set_velocity_body(VelocityBodyYawspeed(max_speed * speed_percentage, 0.0, 0.0, 0.0))
+
+    start = asyncio.get_event_loop().time()
+    while asyncio.get_event_loop().time() - start < 1.0:
+        await drone.offboard.set_velocity_body(VelocityBodyYawspeed(max_speed * speed_percentage, 0.0, 0.0, 0.0))
+        await asyncio.sleep(0.1)
     return max_speed * speed_percentage
 
 async def right_left(drone, speed_percentage):

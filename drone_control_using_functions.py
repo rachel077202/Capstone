@@ -78,21 +78,32 @@ async def run():
         # --- Movement (only when not typing) ---
         if offboard_active and not input_active:
             if keys[pygame.K_w]:
-                foward_speed = await forward_backward(drone, speed_pct)
+                forward_speed = speed_pct
                 right_speed=up_speed=yaw_speed=0.0
             elif keys[pygame.K_d]:
-                right_speed = await right_left(drone, speed_pct)
-                foward_speed=up_speed=yaw_speed=0.0
+                right_speed = speed_pct
+                forward_speed=up_speed=yaw_speed=0.0
             elif keys[pygame.K_e]:
-                yaw_speed = await yaw(drone, speed_pct)
-                foward_speed=right_speed=up_speed=0.0
+                yaw_speed = speed_pct
+                forward_speed=right_speed=up_speed=0.0
             elif keys[pygame.K_r]:
-                up_speed = await up_down(drone, speed_pct)
-                foward_speed=right_speed=yaw_speed=0.0
+                up_speed = speed_pct
+                forward_speed=right_speed=yaw_speed=0.0
             else:
-                foward_speed=right_speed=up_speed=yaw_speed=0.0
-        else:
-            foward_speed=right_speed=up_speed=yaw_speed=0.0
+                forward_speed=right_speed=up_speed=yaw_speed=0.0
+
+            # Always send a setpoint every loop tick
+            max_speed = 2.0
+            max_yaw = 30.0
+            max_vert = 1.5
+            await drone.offboard.set_velocity_body(
+                VelocityBodyYawspeed(
+                    max_speed * forward_speed,
+                    max_speed * right_speed,
+                    -1 * max_vert * up_speed,
+                    max_yaw * yaw_speed
+                )
+            )
 
         # --- HUD ---
         screen.fill((20, 20, 20))
