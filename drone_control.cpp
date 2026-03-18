@@ -21,33 +21,38 @@ WiFiUDP udpRx;
 WiFiUDP udpTx;
 
 // --- State ---
-bool offboard_active       = false;
-bool is_armed              = false;
-bool is_offboard           = false;
-int  seq_step              = 0;
-unsigned long seq_start    = 0;
+bool is_armed    = false;
+bool is_offboard = false;
 
-const int LOOP_HZ = 20;
-const int LOOP_MS = 1000 / LOOP_HZ;
+// --- Timing ---
+// 50Hz setpoint stream to compensate for WiFi packet loss
+// PX4 needs >2Hz sustained — 50Hz means we can lose 24/25 packets and still pass
+const int SETPOINT_HZ  = 50;
+const int SETPOINT_MS  = 1000 / SETPOINT_HZ;
+const int HEARTBEAT_MS = 1000;
 
-// Velocity command struct
-struct VelocityCmd {
-  float vx, vy, vz, yaw_rate;
-};
+// --- Stream tracking ---
+unsigned long streamStartTime   = 0;
+bool          streamingEnough   = false; // true after 3s of continuous streaming
+unsigned long setpointCount     = 0;
+unsigned long lastSetpointPrint = 0;
+
+// --- Offboard sequence ---
+bool          seq_active  = false;
+int           seq_step    = 0;
+unsigned long seq_start   = 0;
 
 // --------------------------------------------------------------------------
 // Forward declarations
 // --------------------------------------------------------------------------
 void sendMavlink(mavlink_message_t& msg);
 void sendHeartbeat();
-void sendHeartbeatOffboard();
 void sendVelocityBody(float vx, float vy, float vz, float yaw_rate_deg);
 void setOffboardMode();
 void readMavlink();
-VelocityCmd getSequenceCmd();
 
 // --------------------------------------------------------------------------
-// MAVLink Send Helpers
+// MAVLink Send
 // --------------------------------------------------------------------------
 
 void sendMavlink(mavlink_message_t& msg) {
@@ -68,14 +73,6 @@ void sendHeartbeat() {
   sendMavlink(msg);
 }
 
-void sendHeartbeatOffboard() {
-  mavlink_message_t msg;
-  mavlink_msg_heartbeat_pack(SYS_ID, COMP_ID, &msg,
-    MAV_TYPE_GCS, MAV_AUTOPILOT_INVALID,
-    MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 0x00060000, MAV_STATE_ACTIVE);
-  sendMavlink(msg);
-}
-
 void sendVelocityBody(float vx, float vy, float vz, float yaw_rate_deg) {
   mavlink_message_t msg;
   float yaw_rate_rad = yaw_rate_deg * (M_PI / 180.0f);
@@ -85,6 +82,7 @@ void sendVelocityBody(float vx, float vy, float vz, float yaw_rate_deg) {
     0, 0, 0, vx, vy, vz, 0, 0, 0, 0, yaw_rate_rad
   );
   sendMavlink(msg);
+  setpointCount++;
 }
 
 void setOffboardMode() {
@@ -109,22 +107,29 @@ void readMavlink() {
   uint8_t buf[MAVLINK_MAX_PACKET_LEN];
   udpRx.read(buf, packetSize);
   mavlink_message_t msg;
-  mavlink_status_t status;
+  mavlink_status_t  status;
   for (int i = 0; i < packetSize; i++) {
     if (!mavlink_parse_char(MAVLINK_COMM_0, buf[i], &msg, &status)) continue;
     if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT && msg.sysid != SYS_ID) {
       target_sysid = msg.sysid;
       mavlink_heartbeat_t hb;
       mavlink_msg_heartbeat_decode(&msg, &hb);
-      bool armed = (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED);
+      bool armed    = (hb.base_mode & MAV_MODE_FLAG_SAFETY_ARMED);
+      bool offboard = (hb.custom_mode == 393216); // 0x00060000
       if (armed != is_armed) {
         is_armed = armed;
         Serial.printf("[STATE] %s\n", is_armed ? "Armed" : "Disarmed");
+        if (is_armed) streamStartTime = millis(); // reset stream timer on arm
       }
-      bool offboard = (hb.custom_mode == 393216); // 0x00060000 = PX4 offboard
       if (offboard != is_offboard) {
         is_offboard = offboard;
-        Serial.printf("[MODE] %s\n", is_offboard ? "Offboard!" : "Not offboard");
+        Serial.printf("[MODE] %s\n", is_offboard ? "*** OFFBOARD ***" : "Not offboard");
+        if (is_offboard && !seq_active) {
+          Serial.println("[SEQ] Offboard detected — starting sequence!");
+          seq_active = true;
+          seq_step   = 0;
+          seq_start  = millis();
+        }
       }
     }
     if (msg.msgid == MAVLINK_MSG_ID_COMMAND_ACK) {
@@ -136,95 +141,68 @@ void readMavlink() {
 }
 
 // --------------------------------------------------------------------------
-// Offboard Sequence (non-blocking state machine)
+// Offboard Sequence (non-blocking)
 // --------------------------------------------------------------------------
 
-VelocityCmd getSequenceCmd() {
+// Returns velocity command for current step
+// All movement at 0.3 m/s — slow and safe for indoor testing
+void runSequence() {
+  if (!seq_active) return;
+
+  // Abort if we leave offboard
+  if (!is_offboard) {
+    Serial.println("[SEQ] Left offboard — sequence aborted.");
+    seq_active = false;
+    return;
+  }
+
   unsigned long elapsed = millis() - seq_start;
-  VelocityCmd cmd = {0, 0, 0, 0};
+  float vx = 0, vy = 0, vz = 0;
 
   switch (seq_step) {
-
-    case 0: // Hover and stream setpoints — wait for RC to confirm offboard
-      if (is_offboard) {
-        Serial.println("[SEQ] Offboard detected! Hovering 3s...");
-        seq_step++; seq_start = millis();
-      }
-      break;
-
-    case 1: // Hover 3s
+    case 0: // Hover 3s to stabilize
       if (elapsed > 3000) {
-        Serial.println("[SEQ] Moving forward...");
+        Serial.println("[SEQ] Step 1: Moving forward 0.3m/s for 2s");
         seq_step++; seq_start = millis();
       }
       break;
-
-    case 2: // Forward 2s
-      cmd.vx = 0.3f;
-      if (elapsed > 2000) {
-        Serial.println("[SEQ] Stopping...");
-        seq_step++; seq_start = millis();
-      }
+    case 1: // Forward
+      vx = 0.3f;
+      if (elapsed > 2000) { seq_step++; seq_start = millis(); Serial.println("[SEQ] Stopping..."); }
       break;
-
-    case 3: // Stop 1s
-      if (elapsed > 1000) {
-        Serial.println("[SEQ] Moving backward...");
-        seq_step++; seq_start = millis();
-      }
+    case 2: // Stop
+      if (elapsed > 1000) { seq_step++; seq_start = millis(); Serial.println("[SEQ] Step 2: Moving backward"); }
       break;
-
-    case 4: // Backward 2s
-      cmd.vx = -0.3f;
-      if (elapsed > 2000) {
-        Serial.println("[SEQ] Stopping...");
-        seq_step++; seq_start = millis();
-      }
+    case 3: // Backward
+      vx = -0.3f;
+      if (elapsed > 2000) { seq_step++; seq_start = millis(); Serial.println("[SEQ] Stopping..."); }
       break;
-
-    case 5: // Stop 1s
-      if (elapsed > 1000) {
-        Serial.println("[SEQ] Moving right...");
-        seq_step++; seq_start = millis();
-      }
+    case 4: // Stop
+      if (elapsed > 1000) { seq_step++; seq_start = millis(); Serial.println("[SEQ] Step 3: Moving right"); }
       break;
-
-    case 6: // Right 2s
-      cmd.vy = 0.3f;
-      if (elapsed > 2000) {
-        Serial.println("[SEQ] Stopping...");
-        seq_step++; seq_start = millis();
-      }
+    case 5: // Right
+      vy = 0.3f;
+      if (elapsed > 2000) { seq_step++; seq_start = millis(); Serial.println("[SEQ] Stopping..."); }
       break;
-
-    case 7: // Stop 1s
-      if (elapsed > 1000) {
-        Serial.println("[SEQ] Moving left...");
-        seq_step++; seq_start = millis();
-      }
+    case 6: // Stop
+      if (elapsed > 1000) { seq_step++; seq_start = millis(); Serial.println("[SEQ] Step 4: Moving left"); }
       break;
-
-    case 8: // Left 2s
-      cmd.vy = -0.3f;
-      if (elapsed > 2000) {
-        Serial.println("[SEQ] Final hover...");
-        seq_step++; seq_start = millis();
-      }
+    case 7: // Left
+      vy = -0.3f;
+      if (elapsed > 2000) { seq_step++; seq_start = millis(); Serial.println("[SEQ] Stopping..."); }
       break;
-
-    case 9: // Final hover 3s
+    case 8: // Final hover
       if (elapsed > 3000) {
-        Serial.println("[SEQ] Complete! Switch RC back to manual.");
-        offboard_active = false;
+        Serial.println("[SEQ] Complete! Flip RC back to manual.");
+        seq_active = false;
         seq_step++;
       }
       break;
-
     default:
       break;
   }
 
-  return cmd;
+  sendVelocityBody(vx, vy, vz, 0);
 }
 
 // --------------------------------------------------------------------------
@@ -243,17 +221,18 @@ void setup() {
   udpTx.begin(TX_PORT);
   esp_task_wdt_deinit();
 
+  // Wait for FC heartbeat
   Serial.println("Waiting for FC heartbeat...");
   bool foundFC = false;
   while (!foundFC) {
     sendHeartbeat();
-    int packetSize = udpRx.parsePacket();
-    if (packetSize) {
+    int sz = udpRx.parsePacket();
+    if (sz) {
       uint8_t buf[MAVLINK_MAX_PACKET_LEN];
-      udpRx.read(buf, packetSize);
+      udpRx.read(buf, sz);
       mavlink_message_t msg;
-      mavlink_status_t status;
-      for (int i = 0; i < packetSize; i++) {
+      mavlink_status_t  status;
+      for (int i = 0; i < sz; i++) {
         if (mavlink_parse_char(MAVLINK_COMM_0, buf[i], &msg, &status)) {
           if (msg.msgid == MAVLINK_MSG_ID_HEARTBEAT && msg.sysid != SYS_ID) {
             target_sysid = msg.sysid;
@@ -266,43 +245,58 @@ void setup() {
     delay(200);
   }
 
-  Serial.println("Waiting for arm via RC transmitter...");
+  Serial.println("\n=== INSTRUCTIONS ===");
+  Serial.println("1. Arm with RC and take off");
+  Serial.println("2. Hover stably at 1-2m");
+  Serial.println("3. The ESP32 will stream setpoints at 50Hz continuously");
+  Serial.println("4. After 3s of armed streaming, try flipping RC to offboard");
+  Serial.println("5. Sequence starts automatically when offboard is detected");
+  Serial.println("====================\n");
+
+  streamStartTime = millis();
 }
 
 // --------------------------------------------------------------------------
 // LOOP
 // --------------------------------------------------------------------------
 
-unsigned long lastHeartbeat = 0;
-unsigned long lastLoop      = 0;
+unsigned long lastHeartbeat  = 0;
+unsigned long lastSetpoint   = 0;
 
 void loop() {
   readMavlink();
   unsigned long now = millis();
 
-  if (now - lastHeartbeat >= 1000) {
+  // Heartbeat every 1s
+  if (now - lastHeartbeat >= HEARTBEAT_MS) {
     sendHeartbeat();
     lastHeartbeat = now;
   }
 
-  if (now - lastLoop < LOOP_MS) return;
-  lastLoop = now;
+  // Setpoints at 50Hz — always stream once armed, hover command if not in sequence
+  if (is_armed && now - lastSetpoint >= SETPOINT_MS) {
+    lastSetpoint = now;
 
-  // Start streaming setpoints as soon as armed so PX4 accepts offboard switch
-  if (!offboard_active && is_armed && seq_step == 0) {
-    Serial.println("Armed! Switch RC to offboard mode to start sequence.");
-    offboard_active = true;
-    seq_start = millis();
+    // Track how long we've been streaming
+    unsigned long streamDuration = now - streamStartTime;
+    if (!streamingEnough && streamDuration >= 3000) {
+      streamingEnough = true;
+      Serial.println("[STREAM] 3s of continuous setpoints reached — try flipping to offboard now!");
+    }
+
+    // Run sequence if active, otherwise hover (zero velocity)
+    if (seq_active) {
+      runSequence(); // sends its own velocity command
+    } else {
+      sendVelocityBody(0, 0, 0, 0); // hover
+    }
   }
 
-  // Abort if disarmed mid-sequence
-  if (offboard_active && !is_armed) {
-    Serial.println("[ABORT] Disarmed! Stopping.");
-    offboard_active = false;
-  }
-
-  if (offboard_active) {
-    VelocityCmd cmd = getSequenceCmd();
-    sendVelocityBody(cmd.vx, cmd.vy, cmd.vz, cmd.yaw_rate);
+  // Print setpoint rate every 5s for diagnostics
+  if (now - lastSetpointPrint >= 5000) {
+    float rate = setpointCount / ((now - lastSetpointPrint + 5000) / 1000.0f);
+    Serial.printf("[DIAG] Setpoints sent in last 5s: %lu (~%.1f Hz)\n", setpointCount, rate);
+    setpointCount      = 0;
+    lastSetpointPrint  = now;
   }
 }
