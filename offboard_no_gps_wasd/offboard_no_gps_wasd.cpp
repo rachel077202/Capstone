@@ -16,20 +16,20 @@
 
 using namespace mavsdk;
 using std::chrono::milliseconds;
-using std::chrono::seconds; // added for wasd control
+using std::chrono::seconds;
 using std::this_thread::sleep_for;
 
-// consts for WASD control (could be tuned for our specific drone))
-constexpr float HOVER_THRUST = 0.55f; // Adjust for your drone
-constexpr float MAX_PITCH_DEG = 15.0f; // degrees
-constexpr float MAX_ROLL_DEG = 15.0f; // degrees
-constexpr float MAX_YAW_RATE = 30.0f;  // degrees per second
-constexpr float THRUST_STEP = 0.02f; // degrees per key press
-constexpr float THRUST_MIN = 0.30f;
-constexpr float THRUST_MAX = 0.80f;
-constexpr int LOOP_HZ = 20;  // setpoint send rate
+// consts for WASD control (could be tuned for our specific drone)
+constexpr float HOVER_THRUST  = 0.55f;
+constexpr float MAX_PITCH_DEG = 15.0f;
+constexpr float MAX_ROLL_DEG  = 15.0f;
+constexpr float MAX_YAW_RATE  = 30.0f;  // degrees per second
+constexpr float THRUST_STEP   = 0.02f;
+constexpr float THRUST_MIN    = 0.30f;
+constexpr float THRUST_MAX    = 0.80f;
+constexpr int   LOOP_HZ       = 20;
 
-// attitude state of the drone (written by input thread, read by send thread)
+// Attitude state (written by input thread, read by send thread)
 struct SharedState {
     std::atomic<float> roll_deg   {0.0f};
     std::atomic<float> pitch_deg  {0.0f};
@@ -45,25 +45,22 @@ struct RawTerminal {
     RawTerminal() {
         tcgetattr(STDIN_FILENO, &original);
         termios raw = original;
-        raw.c_lflag &= ~(ICANON | ECHO);   // no line buffer, no echo
-        raw.c_cc[VMIN]  = 0;               // non-blocking
+        raw.c_lflag &= ~(ICANON | ECHO);
+        raw.c_cc[VMIN]  = 0;
         raw.c_cc[VTIME] = 0;
         tcsetattr(STDIN_FILENO, TCSANOW, &raw);
     }
     ~RawTerminal() { tcsetattr(STDIN_FILENO, TCSANOW, &original); }
 };
 
-// read a single key press from stdin (non-blocking)
 char read_key() {
     char c = '\0';
     read(STDIN_FILENO, &c, 1);
     return c;
 }
 
-// live status display of current attitude and controls
 void print_status(const SharedState& s) {
-    // Move cursor to column 0, overwrite lines
-    printf("\r\033[6A");   // move up 6 lines
+    printf("\r\033[6A");
     printf("  Roll  : %+6.1f deg  (A = left,  D = right)   \n", s.roll_deg.load());
     printf("  Pitch  : %+6.1f deg  (W = fwd,   S = back)    \n", s.pitch_deg.load());
     printf("  Yaw    : %+6.1f deg  (Q = CCW,   E = CW)      \n", s.yaw_deg.load());
@@ -78,67 +75,74 @@ void sender_thread(Offboard& offboard, SharedState& state)
 {
     const auto period = milliseconds(1000 / LOOP_HZ);
 
-    // send the setpoint multiple times before starting offboard (bypassing wifi timeout issue)
     Offboard::Attitude sp{};
-    for (int i = 0; i < 10; ++i) {
-        sp.roll_deg = state.roll_deg;
-        sp.pitch_deg = state.pitch_deg;
-        sp.yaw_deg = state.yaw_deg;
-        sp.thrust_value = state.thrust;
+    sp.roll_deg     = 0.0f;
+    sp.pitch_deg    = 0.0f;
+    sp.yaw_deg      = 0.0f;
+    sp.thrust_value = HOVER_THRUST;
+
+    // Pre-warm: send 30 setpoints (~1.5s) before attempting offboard start.
+    // WiFi latency means 10 is often not enough — 30 is more reliable.
+    std::cout << "Pre-warming setpoint stream...\n";
+    for (int i = 0; i < 30; ++i) {
         offboard.set_attitude(sp);
         sleep_for(period);
     }
 
-    // Now start offboard mode
-    if (offboard.start() != Offboard::Result::Success) {
-        std::cerr << "Offboard start failed\n";
+    // Attempt offboard start with retries (helps on flaky WiFi)
+    Offboard::Result result = Offboard::Result::Unknown;
+    for (int attempt = 1; attempt <= 5; ++attempt) {
+        result = offboard.start();
+        if (result == Offboard::Result::Success) break;
+        std::cerr << "Offboard start attempt " << attempt << "/5 failed, retrying...\n";
+        // Keep sending setpoints between retries so PX4 doesn't time out
+        for (int i = 0; i < 10; ++i) {
+            offboard.set_attitude(sp);
+            sleep_for(period);
+        }
+    }
+
+    if (result != Offboard::Result::Success) {
+        std::cerr << "Offboard start failed after 5 attempts\n";
         state.running = false;
-        return; 
+        return;
     }
 
     state.offboard_ok = true;
     print_status(state);
 
-    // Main loop: send attitude setpoint at 20Hz
+    // Main loop: send attitude setpoint at LOOP_HZ
     while (state.running) {
-        sp.roll_deg = state.roll_deg;
-        sp.pitch_deg = state.pitch_deg;
-        sp.yaw_deg = state.yaw_deg;
+        sp.roll_deg     = state.roll_deg;
+        sp.pitch_deg    = state.pitch_deg;
+        sp.yaw_deg      = state.yaw_deg;
         sp.thrust_value = state.thrust;
         offboard.set_attitude(sp);
         sleep_for(period);
     }
-    // Stop offboard mode on exit
+
     offboard.stop();
     state.offboard_ok = false;
 }
 
-// help instructions for running the program
 void usage(const std::string bin_name)
 {
     std::cout << "Usage: " << bin_name << " <connection_url>\n";
     std::cout << "Connection URL format should be:\n";
-    std::cout << " For UDP: udp://[bind_host][:bind_port]\n";
-    std::cout << " For TCP: tcp://[server_host][:server_port]\n";
-    std::cout << " For Serial: serial:///path/to/serial[:baudrate]\n";
+    std::cout << " For UDP (WiFi, listen mode): udpin://0.0.0.0:14550\n";
+    std::cout << " For UDP (send to IP):        udpout://192.168.4.1:14550\n";
+    std::cout << " For Serial:                  serial:///dev/ttyACM0:57600\n";
     std::cout << "Examples:\n";
-    std::cout << " Offboard control via UDP on port 14540 (default for SITL):\n";
-    std::cout << "   " << bin_name << " udp://:14540\n";
-    std::cout << " Offboard control via TCP to localhost port 5760:\n";
-    std::cout << "   " << bin_name << " tcp://localhost:5760\n";
-    std::cout << " Offboard control via Serial on /dev/ttyUSB0 at 115200 baud:\n";
-    std::cout << "   " << bin_name << " serial:///dev/ttyUSB0:115200\n";
+    std::cout << "  " << bin_name << " udpin://0.0.0.0:14550\n";
+    std::cout << "  " << bin_name << " serial:///dev/ttyACM0:57600\n";
 }
 
 int main(int argc, char** argv)
 {
-    // Check command line arguments (should only be the connection URL)
     if (argc != 2) { usage(argv[0]); return 1; }
 
-    // Initialize MAVSDK and connect to the drone
     Mavsdk mavsdk{Mavsdk::Configuration{ComponentType::GroundStation}};
-    if (mavsdk.add_any_connection(argv[1]) != ConnectionResult::Success)
-    {
+    if (mavsdk.add_any_connection(argv[1]) != ConnectionResult::Success) {
         std::cerr << "Connection failed\n";
         return 1;
     }
@@ -150,21 +154,20 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Instantiate plugins
-    auto action = Action{system.value()};
+    auto action   = Action{system.value()};
     auto offboard = Offboard{system.value()};
     auto telemetry = Telemetry{system.value()};
 
     std::cout << "✓ System connected\n";
 
-    // Check basic health (not all_ok - that requires GPS)
+    // Check basic health
     std::cout << "\nChecking system health...\n";
     auto health = telemetry.health();
     std::cout << "  Accelerometer: " << (health.is_accelerometer_calibration_ok ? "✓" : "✗") << "\n";
-    std::cout << "  Gyroscope: " << (health.is_gyrometer_calibration_ok ? "✓" : "✗") << "\n";
-    std::cout << "  Magnetometer: " << (health.is_magnetometer_calibration_ok ? "✓" : "✗") << "\n";
-    std::cout << "  Local position: " << (health.is_local_position_ok ? "✓" : "✗") << "\n";
-    std::cout << "  Armable: " << (health.is_armable ? "✓" : "✗") << "\n";
+    std::cout << "  Gyroscope:     " << (health.is_gyrometer_calibration_ok     ? "✓" : "✗") << "\n";
+    std::cout << "  Magnetometer:  " << (health.is_magnetometer_calibration_ok  ? "✓" : "✗") << "\n";
+    std::cout << "  Local position:" << (health.is_local_position_ok            ? "✓" : "✗") << "\n";
+    std::cout << "  Armable:       " << (health.is_armable                      ? "✓" : "✗") << "\n";
 
     if (!health.is_armable) {
         std::cerr << "\n⚠ WARNING: System reports not armable.\n";
@@ -173,9 +176,7 @@ int main(int argc, char** argv)
         std::cout << "\nContinue anyway? (y/n): ";
         char response;
         std::cin >> response;
-        if (response != 'y' && response != 'Y') {
-            return 1;
-        }
+        if (response != 'y' && response != 'Y') return 1;
     }
 
     std::cout << "\n=== IMPORTANT SAFETY INFORMATION ===\n";
@@ -202,43 +203,30 @@ int main(int argc, char** argv)
 
     printf("\n\n\n\n\n\n");
 
-    // Shared state for threads
     SharedState state;
     print_status(state);
 
-    // Start sender thread
+    // Start sender thread — pre-warm + offboard start happen inside
     std::thread sender(sender_thread, std::ref(offboard), std::ref(state));
-    
-    // Main input loop (runs in main thread)
+
+    // Main input loop
     {
-        RawTerminal raw;   // enable single-keypress reads, restored on scope exit
+        RawTerminal raw;
 
         while (state.running) {
             char key = read_key();
 
-            // Keys set target attitude; releasing a key snaps back to neutral
-            // To keep the drone moving you hold the key; release = level/stop.
-            // This mirrors how the Python script works (key held = speed applied).
             switch (key) {
-                // Pitch (forward / back)
-                case 'w': case 'W':
-                    state.pitch_deg =  MAX_PITCH_DEG; break;
-                case 's': case 'S':
-                    state.pitch_deg = -MAX_PITCH_DEG; break;
+                case 'w': case 'W': state.pitch_deg =  MAX_PITCH_DEG; break;
+                case 's': case 'S': state.pitch_deg = -MAX_PITCH_DEG; break;
+                case 'd': case 'D': state.roll_deg  =  MAX_ROLL_DEG;  break;
+                case 'a': case 'A': state.roll_deg  = -MAX_ROLL_DEG;  break;
 
-                // Roll (right / left)
-                case 'd': case 'D':
-                    state.roll_deg  =  MAX_ROLL_DEG;  break;
-                case 'a': case 'A':
-                    state.roll_deg  = -MAX_ROLL_DEG;  break;
-
-                // Yaw
                 case 'e': case 'E':
-                    state.yaw_deg = state.yaw_deg +MAX_YAW_RATE * (1.0f / LOOP_HZ); break;
+                    state.yaw_deg = state.yaw_deg + MAX_YAW_RATE * (1.0f / LOOP_HZ); break;
                 case 'q': case 'Q':
                     state.yaw_deg = state.yaw_deg - MAX_YAW_RATE * (1.0f / LOOP_HZ); break;
 
-                // Thrust
                 case 'r': case 'R': {
                     float t = state.thrust + THRUST_STEP;
                     state.thrust = (t > THRUST_MAX) ? THRUST_MAX : t;
@@ -250,20 +238,17 @@ int main(int argc, char** argv)
                     break;
                 }
 
-                // Level / centre
                 case 'h': case 'H':
                     state.roll_deg  = 0.0f;
                     state.pitch_deg = 0.0f;
                     break;
 
-                // Quit
                 case 27:  // ESC
                     std::cout << "\nESC — stopping offboard...\n";
                     state.running = false;
                     break;
 
                 case '\0':
-                    // No key held — snap roll and pitch back to neutral
                     state.roll_deg  = 0.0f;
                     state.pitch_deg = 0.0f;
                     break;
@@ -274,9 +259,9 @@ int main(int argc, char** argv)
             print_status(state);
             sleep_for(milliseconds(1000 / LOOP_HZ));
         }
-    }   // ~RawTerminal() gets called when the scope exits, restoring normal terminal behavior
+    }
 
-    sender.join(); // wait for sender thread to finish
+    sender.join();
 
     std::cout << "\nOffboard control stopped.\n";
     std::cout << "Use your RC to land the drone manually.\n";
