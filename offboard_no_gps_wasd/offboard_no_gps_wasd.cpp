@@ -137,6 +137,27 @@ void usage(const std::string bin_name)
     std::cout << "  " << bin_name << " serial:///dev/ttyACM0:57600\n";
 }
 
+void pitch(SharedState state, float percent)
+{
+    state.pitch_deg =  MAX_PITCH_DEG * percent;
+}
+
+void roll(SharedState state, float percent)
+{
+    state.roll_deg =  MAX_ROLL_DEG * percent;
+}
+
+void yaw(SharedState state, float percent) 
+{
+    state.yaw_deg = state.yaw_deg + MAX_YAW_RATE * percent * (1.0f / LOOP_HZ);
+}
+
+void thrust(SharedState state, float percent) 
+{
+    float t = state.thrust + THRUST_STEP * percent;
+    state.thrust = (t > THRUST_MAX) ? THRUST_MAX : t;
+}
+
 int main(int argc, char** argv)
 {
     if (argc != 2) { usage(argv[0]); return 1; }
@@ -217,24 +238,22 @@ int main(int argc, char** argv)
             char key = read_key();
 
             switch (key) {
-                case 'w': case 'W': state.pitch_deg =  MAX_PITCH_DEG; break;
-                case 's': case 'S': state.pitch_deg = -MAX_PITCH_DEG; break;
-                case 'd': case 'D': state.roll_deg  =  MAX_ROLL_DEG;  break;
-                case 'a': case 'A': state.roll_deg  = -MAX_ROLL_DEG;  break;
+                case 'w': case 'W': pitch(state, 1.0); break;
+                case 's': case 'S': pitch(state, -1.0); break;
+                case 'd': case 'D': roll(state, 1.0);  break;
+                case 'a': case 'A': roll(state, -1.0);  break;
 
                 case 'e': case 'E':
-                    state.yaw_deg = state.yaw_deg + MAX_YAW_RATE * (1.0f / LOOP_HZ); break;
+                    yaw(state, 1.0); break;
                 case 'q': case 'Q':
-                    state.yaw_deg = state.yaw_deg - MAX_YAW_RATE * (1.0f / LOOP_HZ); break;
+                    yaw(state, -1.0); break;
 
                 case 'r': case 'R': {
-                    float t = state.thrust + THRUST_STEP;
-                    state.thrust = (t > THRUST_MAX) ? THRUST_MAX : t;
+                    thrust(state, 1.0);
                     break;
                 }
                 case 'f': case 'F': {
-                    float t = state.thrust - THRUST_STEP;
-                    state.thrust = (t < THRUST_MIN) ? THRUST_MIN : t;
+                    thrust(state, -1.0);
                     break;
                 }
 
