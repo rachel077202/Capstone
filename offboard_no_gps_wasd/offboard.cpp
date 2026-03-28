@@ -1,5 +1,5 @@
 // Offboard control example for indoor flight without GPS
-// Uses WASD controls - works like flying in Acro/Stabilize mode
+// Uses WASD controls OR glove IMU over Serial
 // Safe for testing with manual RC backup
 
 #include <atomic>
@@ -8,6 +8,9 @@
 #include <termios.h>
 #include <thread>
 #include <unistd.h>
+#include <fcntl.h>
+#include <cstdio>
+#include <string>
 
 #include <mavsdk/mavsdk.h>
 #include <mavsdk/plugins/action/action.h>
@@ -19,17 +22,18 @@ using std::chrono::milliseconds;
 using std::chrono::seconds;
 using std::this_thread::sleep_for;
 
-// consts for WASD control (could be tuned for our specific drone)
-constexpr float HOVER_THRUST  = 0.55f;
-constexpr float MAX_PITCH_DEG = 15.0f;
-constexpr float MAX_ROLL_DEG  = 15.0f;
-constexpr float MAX_YAW_RATE  = 30.0f;  // degrees per second
-constexpr float THRUST_STEP   = 0.02f;
-constexpr float THRUST_MIN    = 0.30f;
-constexpr float THRUST_MAX    = 0.80f;
-constexpr int   LOOP_HZ       = 20;
+// --- Constants ---
+constexpr float       HOVER_THRUST  = 0.55f;
+constexpr float       MAX_PITCH_DEG = 15.0f;
+constexpr float       MAX_ROLL_DEG  = 15.0f;
+constexpr float       MAX_YAW_RATE  = 30.0f;
+constexpr float       THRUST_STEP   = 0.02f;
+constexpr float       THRUST_MIN    = 0.30f;
+constexpr float       THRUST_MAX    = 0.80f;
+constexpr int         LOOP_HZ       = 20;
+constexpr const char* SERIAL_PORT   = "/dev/ttyACM0";
 
-// Attitude state (written by input thread, read by send thread)
+// --- Shared attitude state ---
 struct SharedState {
     std::atomic<float> roll_deg   {0.0f};
     std::atomic<float> pitch_deg  {0.0f};
@@ -39,7 +43,7 @@ struct SharedState {
     std::atomic<bool>  offboard_ok{false};
 };
 
-// RAII class to set terminal to raw mode for non-blocking input
+// --- RAII raw terminal ---
 struct RawTerminal {
     termios original;
     RawTerminal() {
@@ -71,6 +75,7 @@ void print_status(const SharedState& s) {
     fflush(stdout);
 }
 
+// --- Sender thread: streams attitude setpoints to PX4 ---
 void sender_thread(Offboard& offboard, SharedState& state)
 {
     const auto period = milliseconds(1000 / LOOP_HZ);
@@ -81,21 +86,17 @@ void sender_thread(Offboard& offboard, SharedState& state)
     sp.yaw_deg      = 0.0f;
     sp.thrust_value = HOVER_THRUST;
 
-    // Pre-warm: send 30 setpoints (~1.5s) before attempting offboard start.
-    // WiFi latency means 10 is often not enough — 30 is more reliable.
     std::cout << "Pre-warming setpoint stream...\n";
     for (int i = 0; i < 30; ++i) {
         offboard.set_attitude(sp);
         sleep_for(period);
     }
 
-    // Attempt offboard start with retries (helps on flaky WiFi)
     Offboard::Result result = Offboard::Result::Unknown;
     for (int attempt = 1; attempt <= 5; ++attempt) {
         result = offboard.start();
         if (result == Offboard::Result::Success) break;
         std::cerr << "Offboard start attempt " << attempt << "/5 failed, retrying...\n";
-        // Keep sending setpoints between retries so PX4 doesn't time out
         for (int i = 0; i < 10; ++i) {
             offboard.set_attitude(sp);
             sleep_for(period);
@@ -111,7 +112,6 @@ void sender_thread(Offboard& offboard, SharedState& state)
     state.offboard_ok = true;
     print_status(state);
 
-    // Main loop: send attitude setpoint at LOOP_HZ
     while (state.running) {
         sp.roll_deg     = state.roll_deg;
         sp.pitch_deg    = state.pitch_deg;
@@ -125,6 +125,50 @@ void sender_thread(Offboard& offboard, SharedState& state)
     state.offboard_ok = false;
 }
 
+// --- Serial reader thread: reads glove IMU from ESP32 over USB ---
+void serial_reader_thread(SharedState& state, const std::string& port)
+{
+    int fd = open(port.c_str(), O_RDWR | O_NOCTTY);
+    if (fd < 0) {
+        std::cerr << "⚠ Could not open serial port " << port << " — falling back to WASD only\n";
+        return;
+    }
+
+    termios tty{};
+    cfsetspeed(&tty, B115200);
+    tty.c_cflag |= (CLOCAL | CREAD | CS8);
+    tty.c_lflag  = 0;
+    tcsetattr(fd, TCSANOW, &tty);
+
+    std::cout << "✓ Serial port " << port << " opened — reading glove IMU data\n";
+
+    std::string line;
+    char c;
+
+    while (state.running) {
+        if (read(fd, &c, 1) > 0) {
+            if (c == '\n') {
+                float pitch, roll, yaw, thrust;
+                if (sscanf(line.c_str(), "%f,%f,%f,%f",
+                           &pitch, &roll, &yaw, &thrust) == 4) {
+                    state.pitch_deg = pitch;
+                    state.roll_deg  = roll;
+                    state.yaw_deg   = yaw;
+                    state.thrust    = thrust;
+                } else if (line.rfind("# ", 0) == 0) {
+                    // Label line from ESP32 e.g. "# Forward"
+                    std::cout << "\n[SEQ] " << line.substr(2) << "\n";
+                }
+                line.clear();
+            } else if (c != '\r') {
+                line += c;
+            }
+        }
+    }
+
+    close(fd);
+}
+
 void usage(const std::string bin_name)
 {
     std::cout << "Usage: " << bin_name << " <connection_url>\n";
@@ -135,27 +179,6 @@ void usage(const std::string bin_name)
     std::cout << "Examples:\n";
     std::cout << "  " << bin_name << " udpin://0.0.0.0:14550\n";
     std::cout << "  " << bin_name << " serial:///dev/ttyACM0:57600\n";
-}
-
-void pitch(SharedState state, float percent)
-{
-    state.pitch_deg =  MAX_PITCH_DEG * percent;
-}
-
-void roll(SharedState state, float percent)
-{
-    state.roll_deg =  MAX_ROLL_DEG * percent;
-}
-
-void yaw(SharedState state, float percent) 
-{
-    state.yaw_deg = state.yaw_deg + MAX_YAW_RATE * percent * (1.0f / LOOP_HZ);
-}
-
-void thrust(SharedState state, float percent) 
-{
-    float t = state.thrust + THRUST_STEP * percent;
-    state.thrust = (t > THRUST_MAX) ? THRUST_MAX : t;
 }
 
 int main(int argc, char** argv)
@@ -175,13 +198,12 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    auto action   = Action{system.value()};
-    auto offboard = Offboard{system.value()};
+    auto action    = Action{system.value()};
+    auto offboard  = Offboard{system.value()};
     auto telemetry = Telemetry{system.value()};
 
     std::cout << "✓ System connected\n";
 
-    // Check basic health
     std::cout << "\nChecking system health...\n";
     auto health = telemetry.health();
     std::cout << "  Accelerometer: " << (health.is_accelerometer_calibration_ok ? "✓" : "✗") << "\n";
@@ -193,7 +215,6 @@ int main(int argc, char** argv)
     if (!health.is_armable) {
         std::cerr << "\n⚠ WARNING: System reports not armable.\n";
         std::cerr << "Check QGroundControl for specific failure reasons.\n";
-        std::cerr << "Common issues: battery low, safety switch, calibration needed.\n";
         std::cout << "\nContinue anyway? (y/n): ";
         char response;
         std::cin >> response;
@@ -204,14 +225,13 @@ int main(int argc, char** argv)
     std::cout << "1. This program uses OFFBOARD mode for direct control\n";
     std::cout << "2. Keep your RC transmitter ON as a safety backup\n";
     std::cout << "3. You can switch back to manual mode on your RC at any time\n";
-    std::cout << "4. The drone responds to WASD keyboard input in real time\n";
+    std::cout << "4. Control input: glove IMU via Serial (WASD as fallback)\n";
     std::cout << "5. Make sure you have enough space for testing\n";
     std::cout << "\nREADY TO ARM AND FLY?\n";
     std::cout << "Press ENTER to continue (or Ctrl+C to cancel)...\n";
     std::cin.ignore();
     std::cin.get();
 
-    // Wait for manual arm via RC / QGC
     if (!telemetry.armed()) {
         std::cout << "Waiting for arm signal (arm via RC or QGC)...\n";
         while (!telemetry.armed()) sleep_for(milliseconds(300));
@@ -219,7 +239,7 @@ int main(int argc, char** argv)
     std::cout << "✓ Armed\n";
 
     std::cout << "\nTake off manually to hover height (~1-2 m).\n"
-              << "Press ENTER when hovering to start WASD control...\n";
+              << "Press ENTER when hovering to start control...\n";
     std::cin.get();
 
     printf("\n\n\n\n\n\n");
@@ -227,10 +247,9 @@ int main(int argc, char** argv)
     SharedState state;
     print_status(state);
 
-    // Start sender thread — pre-warm + offboard start happen inside
     std::thread sender(sender_thread, std::ref(offboard), std::ref(state));
+    std::thread serial(serial_reader_thread, std::ref(state), std::string(SERIAL_PORT));
 
-    // Main input loop
     {
         RawTerminal raw;
 
@@ -238,22 +257,24 @@ int main(int argc, char** argv)
             char key = read_key();
 
             switch (key) {
-                case 'w': case 'W': pitch(state, 1.0); break;
-                case 's': case 'S': pitch(state, -1.0); break;
-                case 'd': case 'D': roll(state, 1.0);  break;
-                case 'a': case 'A': roll(state, -1.0);  break;
+                case 'w': case 'W': state.pitch_deg =  MAX_PITCH_DEG; break;
+                case 's': case 'S': state.pitch_deg = -MAX_PITCH_DEG; break;
+                case 'd': case 'D': state.roll_deg  =  MAX_ROLL_DEG;  break;
+                case 'a': case 'A': state.roll_deg  = -MAX_ROLL_DEG;  break;
 
                 case 'e': case 'E':
-                    yaw(state, 1.0); break;
+                    state.yaw_deg = state.yaw_deg + MAX_YAW_RATE * (1.0f / LOOP_HZ); break;
                 case 'q': case 'Q':
-                    yaw(state, -1.0); break;
+                    state.yaw_deg = state.yaw_deg - MAX_YAW_RATE * (1.0f / LOOP_HZ); break;
 
                 case 'r': case 'R': {
-                    thrust(state, 1.0);
+                    float t = state.thrust + THRUST_STEP;
+                    state.thrust = (t > THRUST_MAX) ? THRUST_MAX : t;
                     break;
                 }
                 case 'f': case 'F': {
-                    thrust(state, -1.0);
+                    float t = state.thrust - THRUST_STEP;
+                    state.thrust = (t < THRUST_MIN) ? THRUST_MIN : t;
                     break;
                 }
 
@@ -281,6 +302,7 @@ int main(int argc, char** argv)
     }
 
     sender.join();
+    serial.join();
 
     std::cout << "\nOffboard control stopped.\n";
     std::cout << "Use your RC to land the drone manually.\n";
